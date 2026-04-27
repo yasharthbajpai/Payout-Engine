@@ -1,7 +1,6 @@
 import random
-import time
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 
 from celery.utils.log import get_task_logger
 from sqlalchemy import select
@@ -105,45 +104,54 @@ def retry_stuck_payouts() -> dict:
     retried = 0
     failed = 0
 
+    # Read stuck payouts in a short read transaction, then process each individually.
     with SyncSessionLocal() as session:
-        stuck_payouts = session.execute(
-            select(Payout).where(
-                Payout.status == PayoutStatus.PROCESSING,
-                Payout.updated_at < cutoff,
-            )
-        ).scalars().all()
+        with session.begin():
+            stuck_ids = [
+                row.id
+                for row in session.execute(
+                    select(Payout.id).where(
+                        Payout.status == PayoutStatus.PROCESSING,
+                        Payout.updated_at < cutoff,
+                    )
+                ).scalars()
+            ]
 
-        for payout in stuck_payouts:
-            if payout.attempts < MAX_ATTEMPTS:
-                delay = (2 ** payout.attempts) * 5  # 10s, 20s, 40s
-                process_payout.apply_async(args=[str(payout.id)], countdown=delay)
-                logger.info(
-                    "Re-enqueued stuck payout %s (attempt %d) with delay %ds",
-                    payout.id, payout.attempts, delay,
-                )
-                retried += 1
-            else:
-                with session.begin_nested():
-                    payout_locked = session.execute(
-                        select(Payout).where(Payout.id == payout.id).with_for_update()
-                    ).scalar_one()
+    for payout_id_stuck in stuck_ids:
+        # Re-read with FOR UPDATE inside its own transaction so we hold the lock
+        # only for the duration of this single payout's update.
+        with SyncSessionLocal() as session:
+            with session.begin():
+                payout_locked = session.execute(
+                    select(Payout).where(Payout.id == payout_id_stuck).with_for_update()
+                ).scalar_one_or_none()
 
-                    if payout_locked.status != PayoutStatus.PROCESSING:
-                        continue
+                if payout_locked is None or payout_locked.status != PayoutStatus.PROCESSING:
+                    continue
 
+                if payout_locked.attempts < MAX_ATTEMPTS:
+                    delay = (2 ** payout_locked.attempts) * 5  # 10s, 20s, 40s
+                    process_payout.apply_async(args=[str(payout_locked.id)], countdown=delay)
+                    logger.info(
+                        "Re-enqueued stuck payout %s (attempt %d) with delay %ds",
+                        payout_locked.id, payout_locked.attempts, delay,
+                    )
+                    retried += 1
+                else:
                     transition_payout(payout_locked, PayoutStatus.FAILED)
                     sync_add_ledger_entry(
                         session,
                         merchant_id=payout_locked.merchant_id,
                         entry_type=EntryType.RELEASE,
                         amount_paise=payout_locked.amount_paise,
-                        description=f"Payout {payout_locked.id} timed out after {MAX_ATTEMPTS} attempts – funds released",
+                        description=(
+                            f"Payout {payout_locked.id} timed out after "
+                            f"{MAX_ATTEMPTS} attempts – funds released"
+                        ),
                         reference_id=payout_locked.id,
                     )
-                    logger.info("Payout %s exhausted retries, marked FAILED", payout.id)
+                    logger.info("Payout %s exhausted retries, marked FAILED", payout_locked.id)
                     failed += 1
-
-        session.commit()
 
     return {"retried": retried, "failed": failed}
 
