@@ -156,3 +156,42 @@ Frontend (React) ──HTTP──► FastAPI backend ──enqueue──► Redi
 - **Idempotency**: Each `(merchant_id, idempotency_key)` pair is stored; replays return the cached response.
 
 See [EXPLAINER.md](./EXPLAINER.md) for detailed technical answers.
+
+---
+
+## Live Deployment
+
+| Service | Platform | URL |
+|---|---|---|
+| Frontend | Vercel | [payout-engine-three.vercel.app](https://payout-engine-three.vercel.app) |
+| Backend API | Railway | [backend-production-cf00.up.railway.app](https://backend-production-cf00.up.railway.app) |
+| API Docs | Railway | [backend-production-cf00.up.railway.app/docs](https://backend-production-cf00.up.railway.app/docs) |
+| PostgreSQL | Railway | Managed (internal) |
+| Redis | Railway | Managed (internal) |
+| Celery Worker + Beat | Railway | Internal service |
+
+### Deployment architecture
+
+- **Frontend** is a static Vite build served by Vercel. API calls to `/api/*` are proxied to the Railway backend via Vercel rewrites (`frontend/vercel.json`).
+- **Backend, Celery, Postgres, Redis** all run on Railway. The backend auto-runs migrations and seeds on startup.
+
+### Deploying your own instance
+
+**Backend (Railway):**
+
+1. Create a Railway project with Postgres and Redis plugins
+2. Add a service from the GitHub repo with root directory `backend`
+3. Set environment variables:
+   - `DATABASE_URL` — Postgres URL with `postgresql+asyncpg://` prefix
+   - `SYNC_DATABASE_URL` — Postgres URL with `postgresql+psycopg2://` prefix
+   - `REDIS_URL` — Redis URL from Railway
+   - `SECRET_KEY` — any random string
+4. Set start command: `sh -c "alembic upgrade head && python -m app.seed && uvicorn app.main:app --host 0.0.0.0 --port $PORT"`
+5. Add a Celery worker service (same repo, root `backend`) with start command: `sh start_celery.sh`
+
+**Frontend (Vercel):**
+
+1. Import the GitHub repo on Vercel
+2. Set root directory to `frontend`
+3. Deploy — no environment variables needed
+4. Update `frontend/vercel.json` to point the rewrite to your Railway backend URL
