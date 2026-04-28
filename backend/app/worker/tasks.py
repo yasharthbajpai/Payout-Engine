@@ -37,17 +37,19 @@ def process_payout(self, payout_id: str) -> dict:
                 logger.error("Payout %s not found", payout_id)
                 return {"error": "not_found"}
 
-            if payout.status != PayoutStatus.PENDING:
-                logger.warning("Payout %s is not PENDING (status=%s), skipping", payout_id, payout.status)
+            if payout.status == PayoutStatus.PROCESSING:
+                # Retry path: already PROCESSING from a previous hung attempt.
+                payout.attempts += 1
+            elif payout.status == PayoutStatus.PENDING:
+                try:
+                    transition_payout(payout, PayoutStatus.PROCESSING)
+                except InvalidStateTransition as exc:
+                    logger.error("Invalid transition: %s", exc)
+                    return {"error": str(exc)}
+                payout.attempts += 1
+            else:
+                logger.warning("Payout %s in terminal state %s, skipping", payout_id, payout.status)
                 return {"status": payout.status}
-
-            try:
-                transition_payout(payout, PayoutStatus.PROCESSING)
-            except InvalidStateTransition as exc:
-                logger.error("Invalid transition: %s", exc)
-                return {"error": str(exc)}
-
-            payout.attempts += 1
             session.flush()
 
     # Simulate network call outside transaction so we don't hold locks during I/O
@@ -130,6 +132,7 @@ def retry_stuck_payouts() -> dict:
                     continue
 
                 if payout_locked.attempts < MAX_ATTEMPTS:
+                    payout_locked.updated_at = datetime.utcnow()
                     delay = (2 ** payout_locked.attempts) * 5  # 10s, 20s, 40s
                     process_payout.apply_async(args=[str(payout_locked.id)], countdown=delay)
                     logger.info(
